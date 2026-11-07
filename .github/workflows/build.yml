@@ -1,0 +1,776 @@
+name: Build Vita VPK
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: vitasdk/vitasdk:latest
+    steps:
+      - name: Write project files
+        run: |
+          mkdir -p app/src
+          cat > app/src/main.c <<'MAIN_C_EOF'
+          // Plain Walk - PS Vita homebrew starter
+          // First-person camera on a flat plane, PS1-style low-poly props,
+          // pick-up weapons, a tiny inventory, and a held-weapon view model.
+          //
+          // Controls
+          //   Left stick   walk            Right stick  look
+          //   X            pick up item    TRIANGLE     open / close inventory
+          //   (inventory)  D-pad up/down select, X equip / unequip, O close
+          //   START        quit
+          //
+          // Rendering: vitaGL (fixed-function), flat-shaded, vertex-colored, linear fog.
+
+          #include <vitasdk.h>
+          #include <vitaGL.h>
+          #include <math.h>
+          #include <string.h>
+          #include <ctype.h>
+          #include <stdio.h>
+
+          #define WORLD_HALF  30.0f      // plane spans -30..+30 on X and Z
+          #define EYE_HEIGHT  1.6f
+          #define MOVE_SPEED  4.5f       // units / second
+          #define LOOK_SPEED  2.4f       // radians / second at full stick
+          #define DEADZONE    0.15f
+          #define PLAYER_R    0.4f
+          #define PI_F        3.14159265f
+
+          // Held-weapon placement in camera space (tweak these to taste).
+          // The weapon is modelled with its grip at the origin and the blade along +Y.
+          #define VM_X        0.40f      // + = right
+          #define VM_Y       -0.30f      // + = up
+          #define VM_Z       -0.70f      // - = away from camera
+          #define VM_ROT_Z    8.0f       // lean blade toward the left (degrees)
+          #define VM_ROT_X  -12.0f       // tilt blade away from the camera (degrees)
+
+          #define V(x, y, z)  ((vec3){(x), (y), (z)})
+          #define C(r, g, b)  ((rgb){(r), (g), (b)})
+
+          typedef struct { float x, y, z; } vec3;
+          typedef struct { float r, g, b; } rgb;
+          typedef struct { float x, z, r; } collider;
+
+          // ---------------------------------------------------------------- mesh ----
+
+          typedef struct { float *v; float *c; int n; int max; } Mesh;
+
+          #define DECLARE_MESH(name, maxv)                 \
+              static float name##_v[(maxv) * 3];           \
+              static float name##_c[(maxv) * 4];           \
+              static Mesh name = { name##_v, name##_c, 0, (maxv) }
+
+          DECLARE_MESH(world_mesh, 30000);
+          DECLARE_MESH(hand_mesh, 1500);
+          DECLARE_MESH(sword_mesh, 1000);
+          DECLARE_MESH(mace_mesh, 1500);
+
+          static Mesh *cur;   // mesh the add_* helpers currently write into
+
+          static collider colliders[64];
+          static int      ncolliders = 0;
+
+          static void add_collider(float x, float z, float r) {
+              if (ncolliders < 64) colliders[ncolliders++] = (collider){x, z, r};
+          }
+
+          static vec3 v_sub(vec3 a, vec3 b) { return V(a.x - b.x, a.y - b.y, a.z - b.z); }
+          static vec3 v_cross(vec3 a, vec3 b) {
+              return V(a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x);
+          }
+          static vec3 v_norm(vec3 a) {
+              float l = sqrtf(a.x * a.x + a.y * a.y + a.z * a.z);
+              return l > 1e-6f ? V(a.x / l, a.y / l, a.z / l) : V(0, 1, 0);
+          }
+
+          // Flat-shaded triangle. Shading is baked from a fixed light direction and is
+          // two-sided, so winding order doesn't matter.
+          static void add_tri(vec3 a, vec3 b, vec3 c, rgb col) {
+              if (cur->n + 3 > cur->max) return;
+
+              vec3 n = v_cross(v_sub(b, a), v_sub(c, a));
+              float len = sqrtf(n.x * n.x + n.y * n.y + n.z * n.z);
+
+              float shade = 0.7f;
+              if (len > 1e-6f) {
+                  float d = fabsf((n.x * 0.45f + n.y * 0.80f + n.z * 0.40f) / len);
+                  shade = 0.45f + 0.55f * d;
+              }
+
+              vec3 p[3] = {a, b, c};
+              for (int i = 0; i < 3; i++) {
+                  int k = cur->n++;
+                  cur->v[k * 3 + 0] = p[i].x;
+                  cur->v[k * 3 + 1] = p[i].y;
+                  cur->v[k * 3 + 2] = p[i].z;
+                  cur->c[k * 4 + 0] = col.r * shade;
+                  cur->c[k * 4 + 1] = col.g * shade;
+                  cur->c[k * 4 + 2] = col.b * shade;
+                  cur->c[k * 4 + 3] = 1.0f;
+              }
+          }
+
+          static void add_quad(vec3 a, vec3 b, vec3 c, vec3 d, rgb col) {
+              add_tri(a, b, c, col);
+              add_tri(a, c, d, col);
+          }
+
+          static void add_box(float cx, float y0, float cz, float sx, float sy, float sz, rgb col) {
+              float x0 = cx - sx / 2, x1 = cx + sx / 2;
+              float z0 = cz - sz / 2, z1 = cz + sz / 2;
+              float y1 = y0 + sy;
+              add_quad(V(x0, y1, z0), V(x1, y1, z0), V(x1, y1, z1), V(x0, y1, z1), col); // top
+              add_quad(V(x0, y0, z1), V(x1, y0, z1), V(x1, y1, z1), V(x0, y1, z1), col); // +z
+              add_quad(V(x1, y0, z0), V(x0, y0, z0), V(x0, y1, z0), V(x1, y1, z0), col); // -z
+              add_quad(V(x1, y0, z1), V(x1, y0, z0), V(x1, y1, z0), V(x1, y1, z1), col); // +x
+              add_quad(V(x0, y0, z0), V(x0, y0, z1), V(x0, y1, z1), V(x0, y1, z0), col); // -x
+          }
+
+          static void add_pyramid(float cx, float y0, float cz, float base, float height, rgb col) {
+              float h = base / 2;
+              vec3 p0 = V(cx - h, y0, cz - h), p1 = V(cx + h, y0, cz - h);
+              vec3 p2 = V(cx + h, y0, cz + h), p3 = V(cx - h, y0, cz + h);
+              vec3 apex = V(cx, y0 + height, cz);
+              add_tri(p0, p1, apex, col);
+              add_tri(p1, p2, apex, col);
+              add_tri(p2, p3, apex, col);
+              add_tri(p3, p0, apex, col);
+              add_quad(p0, p1, p2, p3, col);
+          }
+
+          static void add_cylinder(float cx, float y0, float cz, float r, float height, int sides, rgb col) {
+              float y1 = y0 + height;
+              for (int i = 0; i < sides; i++) {
+                  float a0 = 2 * PI_F * i / sides, a1 = 2 * PI_F * (i + 1) / sides;
+                  vec3 b0 = V(cx + cosf(a0) * r, y0, cz + sinf(a0) * r);
+                  vec3 b1 = V(cx + cosf(a1) * r, y0, cz + sinf(a1) * r);
+                  vec3 t0 = V(b0.x, y1, b0.z), t1 = V(b1.x, y1, b1.z);
+                  add_quad(b0, b1, t1, t0, col);
+                  add_tri(V(cx, y1, cz), t0, t1, col);
+              }
+          }
+
+          static void add_cone(float cx, float y0, float cz, float r, float height, int sides, rgb col) {
+              vec3 apex = V(cx, y0 + height, cz);
+              for (int i = 0; i < sides; i++) {
+                  float a0 = 2 * PI_F * i / sides, a1 = 2 * PI_F * (i + 1) / sides;
+                  vec3 b0 = V(cx + cosf(a0) * r, y0, cz + sinf(a0) * r);
+                  vec3 b1 = V(cx + cosf(a1) * r, y0, cz + sinf(a1) * r);
+                  add_tri(b0, b1, apex, col);
+                  add_tri(V(cx, y0, cz), b0, b1, col);
+              }
+          }
+
+          // Tube between two arbitrary points (arms, handles, shafts).
+          static void add_prism(vec3 a, vec3 b, float r, int sides, rgb col) {
+              vec3 d = v_norm(v_sub(b, a));
+              vec3 ref = fabsf(d.y) < 0.9f ? V(0, 1, 0) : V(1, 0, 0);
+              vec3 u = v_norm(v_cross(d, ref));
+              vec3 w = v_cross(d, u);
+              for (int i = 0; i < sides; i++) {
+                  float a0 = 2 * PI_F * i / sides, a1 = 2 * PI_F * (i + 1) / sides;
+                  float c0 = cosf(a0) * r, s0 = sinf(a0) * r, c1 = cosf(a1) * r, s1 = sinf(a1) * r;
+                  vec3 o0 = V(u.x * c0 + w.x * s0, u.y * c0 + w.y * s0, u.z * c0 + w.z * s0);
+                  vec3 o1 = V(u.x * c1 + w.x * s1, u.y * c1 + w.y * s1, u.z * c1 + w.z * s1);
+                  vec3 a0p = V(a.x + o0.x, a.y + o0.y, a.z + o0.z), a1p = V(a.x + o1.x, a.y + o1.y, a.z + o1.z);
+                  vec3 b0p = V(b.x + o0.x, b.y + o0.y, b.z + o0.z), b1p = V(b.x + o1.x, b.y + o1.y, b.z + o1.z);
+                  add_quad(a0p, a1p, b1p, b0p, col);
+                  add_tri(b, b0p, b1p, col);
+              }
+          }
+
+          static void add_octahedron(float cx, float cy, float cz, float r, rgb c1, rgb c2) {
+              vec3 top = V(cx, cy + r * 1.4f, cz), bot = V(cx, cy - r * 1.4f, cz);
+              vec3 e[4] = {V(cx + r, cy, cz), V(cx, cy, cz + r), V(cx - r, cy, cz), V(cx, cy, cz - r)};
+              for (int i = 0; i < 4; i++) {
+                  vec3 a = e[i], b = e[(i + 1) % 4];
+                  add_tri(a, b, top, (i & 1) ? c1 : c2);
+                  add_tri(b, a, bot, (i & 1) ? c2 : c1);
+              }
+          }
+
+          // --------------------------------------------------------------- scene ----
+
+          static void build_ground(void) {
+              const int n = 30;
+              const float t = 2.0f;
+              for (int j = 0; j < n; j++) {
+                  for (int i = 0; i < n; i++) {
+                      float x0 = -WORLD_HALF + i * t, z0 = -WORLD_HALF + j * t;
+                      float var = ((i * 7 + j * 13) % 3) * 0.025f;
+                      rgb c = ((i + j) & 1) ? C(0.26f + var, 0.50f + var, 0.22f)
+                                            : C(0.22f + var, 0.44f + var, 0.19f);
+                      add_quad(V(x0, 0, z0), V(x0, 0, z0 + t), V(x0 + t, 0, z0 + t), V(x0 + t, 0, z0), c);
+                  }
+              }
+          }
+
+          static void add_tree(float x, float z) {
+              add_cylinder(x, 0.0f, z, 0.25f, 1.6f, 6, C(0.40f, 0.26f, 0.14f));
+              add_cone(x, 1.4f, z, 1.4f, 3.2f, 7, C(0.10f, 0.35f, 0.14f));
+              add_cone(x, 3.0f, z, 1.0f, 2.4f, 7, C(0.13f, 0.42f, 0.17f));
+              add_collider(x, z, 0.5f);
+          }
+
+          static void build_scene(void) {
+              cur = &world_mesh;
+              build_ground();
+
+              // Crate stack
+              add_box(6.0f, 0.0f, -6.0f, 2.0f, 2.0f, 2.0f, C(0.62f, 0.42f, 0.20f));
+              add_box(6.3f, 2.0f, -6.0f, 1.2f, 1.2f, 1.2f, C(0.70f, 0.48f, 0.24f));
+              add_collider(6.0f, -6.0f, 1.45f);
+
+              // Sand pyramid
+              add_pyramid(-9.0f, 0.0f, -11.0f, 6.0f, 5.0f, C(0.80f, 0.70f, 0.42f));
+              add_collider(-9.0f, -11.0f, 3.0f);
+
+              // Trees
+              add_tree(-5.0f, 4.0f);
+              add_tree(4.0f, 9.0f);
+              add_tree(-13.0f, 6.0f);
+              add_tree(11.0f, 3.0f);
+              add_tree(15.0f, -13.0f);
+
+              // Ring of stone pillars around the start point
+              for (int i = 0; i < 8; i++) {
+                  float a = 2 * PI_F * i / 8;
+                  float x = cosf(a) * 11.0f, z = sinf(a) * 11.0f;
+                  add_cylinder(x, 0.0f, z, 0.5f, 3.5f, 8, C(0.58f, 0.58f, 0.62f));
+                  add_box(x, 3.5f, z, 1.3f, 0.35f, 1.3f, C(0.48f, 0.48f, 0.52f));
+                  add_collider(x, z, 0.75f);
+              }
+
+              // Pedestal + floating gem
+              add_box(0.0f, 0.0f, -5.0f, 1.4f, 0.8f, 1.4f, C(0.50f, 0.50f, 0.54f));
+              add_octahedron(0.0f, 1.9f, -5.0f, 0.6f, C(0.25f, 0.85f, 0.95f), C(0.85f, 0.30f, 0.90f));
+              add_collider(0.0f, -5.0f, 1.1f);
+          }
+
+          // ------------------------------------------------- weapons & right hand ----
+          // Weapon meshes: grip at the origin, blade/shaft along +Y, flat faces toward +Z.
+
+          static void build_sword(void) {
+              cur = &sword_mesh;
+              rgb leather = C(0.35f, 0.22f, 0.12f);
+              rgb steel = C(0.70f, 0.76f, 0.80f), steel2 = C(0.52f, 0.60f, 0.66f);
+              rgb guard = C(0.42f, 0.50f, 0.58f);
+
+              add_prism(V(0, -0.20f, 0), V(0, 0.0f, 0), 0.022f, 6, leather);   // grip
+              add_box(0, -0.25f, 0, 0.07f, 0.05f, 0.07f, guard);               // pommel
+              add_box(0, 0.0f, 0, 0.20f, 0.035f, 0.05f, guard);                // cross-guard
+              add_box(-0.14f, 0.0f, 0, 0.07f, 0.09f, 0.04f, guard);            // guard wings
+              add_box( 0.14f, 0.0f, 0, 0.07f, 0.09f, 0.04f, guard);
+
+              // Diamond cross-section blade with a pointed tip.
+              float y0 = 0.035f, ysh = 0.72f, y1 = 0.88f, hw = 0.06f, ht = 0.016f;
+              vec3 bl = V(-hw, y0, 0), br = V(hw, y0, 0), bf = V(0, y0, ht), bb = V(0, y0, -ht);
+              vec3 sl = V(-hw, ysh, 0), sr = V(hw, ysh, 0), sf = V(0, ysh, ht), sb = V(0, ysh, -ht);
+              vec3 tip = V(0, y1, 0);
+              add_quad(bl, bf, sf, sl, steel);
+              add_quad(bf, br, sr, sf, steel2);
+              add_quad(bb, bl, sl, sb, steel2);
+              add_quad(br, bb, sb, sr, steel);
+              add_tri(sl, sf, tip, steel);
+              add_tri(sf, sr, tip, steel2);
+              add_tri(sb, sl, tip, steel2);
+              add_tri(sr, sb, tip, steel);
+          }
+
+          static void build_mace(void) {
+              cur = &mace_mesh;
+              rgb wood = C(0.42f, 0.28f, 0.15f), iron = C(0.45f, 0.47f, 0.52f), iron2 = C(0.58f, 0.60f, 0.66f);
+
+              add_prism(V(0, -0.22f, 0), V(0, 0.55f, 0), 0.025f, 6, wood);     // shaft
+              add_box(0, -0.27f, 0, 0.07f, 0.05f, 0.07f, iron);                // pommel
+              add_cylinder(0, 0.48f, 0, 0.085f, 0.20f, 8, iron);               // head
+              add_cone(0, 0.68f, 0, 0.085f, 0.12f, 8, iron2);                  // top spike
+              add_box(-0.115f, 0.54f, 0, 0.06f, 0.07f, 0.06f, iron2);          // studs
+              add_box( 0.115f, 0.54f, 0, 0.06f, 0.07f, 0.06f, iron2);
+              add_box(0, 0.54f, -0.115f, 0.06f, 0.07f, 0.06f, iron2);
+              add_box(0, 0.54f,  0.115f, 0.06f, 0.07f, 0.06f, iron2);
+          }
+
+          // Right hand + forearm, fingers wrapped around the grip, arm leaving the
+          // bottom-right corner of the screen.
+          static void build_hand(void) {
+              cur = &hand_mesh;
+              rgb skin = C(0.80f, 0.58f, 0.44f), skin2 = C(0.70f, 0.50f, 0.38f);
+              rgb brace = C(0.38f, 0.30f, 0.24f);
+
+              add_box(0.035f, -0.155f, -0.005f, 0.11f, 0.14f, 0.05f, skin2);   // back of hand
+              for (int k = 0; k < 4; k++)                                      // fingers
+                  add_box(0.01f, -0.15f + 0.034f * k, 0.035f, 0.095f, 0.03f, 0.045f, skin);
+              add_box(-0.03f, -0.03f, 0.035f, 0.035f, 0.035f, 0.045f, skin);   // thumb
+              add_prism(V(0.06f, -0.16f, 0.0f), V(0.75f, -0.80f, 0.18f), 0.065f, 6, skin);     // forearm
+              add_prism(V(0.18f, -0.27f, 0.02f), V(0.40f, -0.47f, 0.08f), 0.085f, 6, brace);   // bracer
+          }
+
+          // ----------------------------------------------------------- inventory ----
+
+          typedef enum { ITEM_SWORD = 0, ITEM_MACE = 1, ITEM_COUNT } ItemId;
+
+          typedef struct { const char *name; const char *desc; Mesh *mesh; } ItemDef;
+
+          static const ItemDef item_defs[ITEM_COUNT] = {
+              { "IRON SWORD", "A PLAIN BLADE. STILL SHARP.", &sword_mesh },
+              { "STONE MACE", "HEAVY AND BLUNT.",            &mace_mesh  },
+          };
+
+          #define INV_MAX 8
+          static int inv[INV_MAX];          // item ids
+          static int inv_n = 0;
+          static int equipped_slot = -1;    // index into inv[], -1 = empty hand
+          static int inv_open = 0;
+          static int inv_sel = 0;
+
+          typedef struct { float x, z; int item; int taken; } Pickup;
+          static Pickup pickups[] = {
+              { -2.5f, 2.5f, ITEM_SWORD, 0 },
+              {  7.0f, -1.5f, ITEM_MACE, 0 },
+          };
+          #define NUM_PICKUPS ((int)(sizeof(pickups) / sizeof(pickups[0])))
+          #define PICKUP_RANGE 2.2f
+
+          // ----------------------------------------------------------- HUD / font ----
+          // Tiny built-in 5x7 bitmap font (uppercase, digits, a few symbols).
+
+          #define FONT_CHARS " ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-.:>[]/!"
+
+          static const unsigned char font[][7] = {
+              {0, 0, 0, 0, 0, 0, 0},                                                           // space
+              {0b01110, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001},                 // A
+              {0b11110, 0b10001, 0b10001, 0b11110, 0b10001, 0b10001, 0b11110},                 // B
+              {0b01110, 0b10001, 0b10000, 0b10000, 0b10000, 0b10001, 0b01110},                 // C
+              {0b11110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b11110},                 // D
+              {0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b11111},                 // E
+              {0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b10000},                 // F
+              {0b01110, 0b10001, 0b10000, 0b10111, 0b10001, 0b10001, 0b01111},                 // G
+              {0b10001, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001},                 // H
+              {0b01110, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110},                 // I
+              {0b00111, 0b00010, 0b00010, 0b00010, 0b00010, 0b10010, 0b01100},                 // J
+              {0b10001, 0b10010, 0b10100, 0b11000, 0b10100, 0b10010, 0b10001},                 // K
+              {0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b11111},                 // L
+              {0b10001, 0b11011, 0b10101, 0b10101, 0b10001, 0b10001, 0b10001},                 // M
+              {0b10001, 0b11001, 0b10101, 0b10011, 0b10001, 0b10001, 0b10001},                 // N
+              {0b01110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110},                 // O
+              {0b11110, 0b10001, 0b10001, 0b11110, 0b10000, 0b10000, 0b10000},                 // P
+              {0b01110, 0b10001, 0b10001, 0b10001, 0b10101, 0b10010, 0b01101},                 // Q
+              {0b11110, 0b10001, 0b10001, 0b11110, 0b10100, 0b10010, 0b10001},                 // R
+              {0b01111, 0b10000, 0b10000, 0b01110, 0b00001, 0b00001, 0b11110},                 // S
+              {0b11111, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100},                 // T
+              {0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110},                 // U
+              {0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01010, 0b00100},                 // V
+              {0b10001, 0b10001, 0b10001, 0b10101, 0b10101, 0b11011, 0b10001},                 // W
+              {0b10001, 0b10001, 0b01010, 0b00100, 0b01010, 0b10001, 0b10001},                 // X
+              {0b10001, 0b10001, 0b01010, 0b00100, 0b00100, 0b00100, 0b00100},                 // Y
+              {0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b10000, 0b11111},                 // Z
+              {0b01110, 0b10001, 0b10011, 0b10101, 0b11001, 0b10001, 0b01110},                 // 0
+              {0b00100, 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110},                 // 1
+              {0b01110, 0b10001, 0b00001, 0b00010, 0b00100, 0b01000, 0b11111},                 // 2
+              {0b11110, 0b00001, 0b00001, 0b01110, 0b00001, 0b00001, 0b11110},                 // 3
+              {0b00010, 0b00110, 0b01010, 0b10010, 0b11111, 0b00010, 0b00010},                 // 4
+              {0b11111, 0b10000, 0b11110, 0b00001, 0b00001, 0b10001, 0b01110},                 // 5
+              {0b00110, 0b01000, 0b10000, 0b11110, 0b10001, 0b10001, 0b01110},                 // 6
+              {0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b01000, 0b01000},                 // 7
+              {0b01110, 0b10001, 0b10001, 0b01110, 0b10001, 0b10001, 0b01110},                 // 8
+              {0b01110, 0b10001, 0b10001, 0b01111, 0b00001, 0b00010, 0b01100},                 // 9
+              {0, 0, 0, 0b11111, 0, 0, 0},                                                     // -
+              {0, 0, 0, 0, 0, 0b01100, 0b01100},                                               // .
+              {0, 0b01100, 0b01100, 0, 0b01100, 0b01100, 0},                                   // :
+              {0b01000, 0b00100, 0b00010, 0b00001, 0b00010, 0b00100, 0b01000},                 // >
+              {0b01110, 0b01000, 0b01000, 0b01000, 0b01000, 0b01000, 0b01110},                 // [
+              {0b01110, 0b00010, 0b00010, 0b00010, 0b00010, 0b00010, 0b01110},                 // ]
+              {0b00001, 0b00010, 0b00010, 0b00100, 0b01000, 0b01000, 0b10000},                 // /
+              {0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0, 0b00100},                       // !
+          };
+
+          _Static_assert(sizeof(font) / sizeof(font[0]) == sizeof(FONT_CHARS) - 1, "font table size");
+
+          #define HUD_MAX 40000
+          static float hud_v[HUD_MAX * 2];
+          static float hud_c[HUD_MAX * 4];
+          static int   hud_n = 0;
+
+          static void hud_rect(float x, float y, float w, float h, float r, float g, float b, float a) {
+              if (hud_n + 6 > HUD_MAX) return;
+              float xs[6] = {x, x + w, x + w, x, x + w, x};
+              float ys[6] = {y, y, y + h, y, y + h, y + h};
+              for (int i = 0; i < 6; i++) {
+                  hud_v[hud_n * 2 + 0] = xs[i];
+                  hud_v[hud_n * 2 + 1] = ys[i];
+                  hud_c[hud_n * 4 + 0] = r;
+                  hud_c[hud_n * 4 + 1] = g;
+                  hud_c[hud_n * 4 + 2] = b;
+                  hud_c[hud_n * 4 + 3] = a;
+                  hud_n++;
+              }
+          }
+
+          static float hud_text_width(const char *s, float scale) { return (float)strlen(s) * 6.0f * scale; }
+
+          static void hud_text_raw(float x, float y, float scale, const char *s,
+                                   float r, float g, float b, float a) {
+              for (; *s; s++, x += 6.0f * scale) {
+                  const char *p = strchr(FONT_CHARS, toupper((unsigned char)*s));
+                  if (!p || !*p) continue;
+                  const unsigned char *rows = font[p - FONT_CHARS];
+                  for (int row = 0; row < 7; row++) {
+                      int col = 0;
+                      while (col < 5) {
+                          if (rows[row] & (1 << (4 - col))) {
+                              int start = col;
+                              while (col < 5 && (rows[row] & (1 << (4 - col)))) col++;
+                              hud_rect(x + start * scale, y + row * scale, (col - start) * scale, scale, r, g, b, a);
+                          } else {
+                              col++;
+                          }
+                      }
+                  }
+              }
+          }
+
+          static void hud_text(float x, float y, float scale, const char *s, float r, float g, float b) {
+              hud_text_raw(x + scale, y + scale, scale, s, 0, 0, 0, 0.8f);   // drop shadow
+              hud_text_raw(x, y, scale, s, r, g, b, 1.0f);
+          }
+
+          static void hud_text_centered(float y, float scale, const char *s, float r, float g, float b) {
+              hud_text((960.0f - hud_text_width(s, scale)) / 2.0f, y, scale, s, r, g, b);
+          }
+
+          static void build_hud(const Pickup *near_pickup, const char *toast) {
+              hud_n = 0;
+
+              if (!inv_open) {
+                  hud_text(12, 10, 2, "TRIANGLE: INVENTORY", 0.9f, 0.9f, 0.9f);
+                  if (near_pickup) {
+                      char buf[64];
+                      snprintf(buf, sizeof(buf), "X: PICK UP %s", item_defs[near_pickup->item].name);
+                      hud_text_centered(470, 3, buf, 1.0f, 0.95f, 0.6f);
+                  }
+                  if (toast) hud_text_centered(425, 3, toast, 0.7f, 1.0f, 0.7f);
+                  return;
+              }
+
+              // Inventory panel
+              hud_rect(0, 0, 960, 544, 0, 0, 0, 0.45f);
+              hud_rect(230, 70, 500, 380, 0.05f, 0.05f, 0.08f, 0.88f);
+              hud_rect(230, 70, 500, 4, 0.7f, 0.6f, 0.3f, 1.0f);
+              hud_rect(230, 446, 500, 4, 0.7f, 0.6f, 0.3f, 1.0f);
+              hud_text(260, 92, 4, "INVENTORY", 0.95f, 0.85f, 0.5f);
+
+              if (inv_n == 0) {
+                  hud_text(260, 170, 3, "EMPTY", 0.6f, 0.6f, 0.6f);
+              }
+              for (int i = 0; i < inv_n; i++) {
+                  float y = 160 + i * 34;
+                  if (i == inv_sel) hud_rect(248, y - 6, 464, 32, 0.25f, 0.22f, 0.12f, 0.9f);
+                  hud_text(262, y, 3, i == inv_sel ? ">" : " ", 1.0f, 0.9f, 0.4f);
+                  hud_text(300, y, 3, item_defs[inv[i]].name, 0.9f, 0.9f, 0.9f);
+                  if (i == equipped_slot) hud_text(540, y, 3, "EQUIPPED", 0.5f, 1.0f, 0.5f);
+              }
+              if (inv_n > 0) hud_text(260, 400, 2, item_defs[inv[inv_sel]].desc, 0.7f, 0.7f, 0.75f);
+              hud_text(260, 424, 2, "X: EQUIP / UNEQUIP    O: CLOSE", 0.8f, 0.8f, 0.8f);
+          }
+
+          // --------------------------------------------------------------- input ----
+
+          static float axis(unsigned char raw) {
+              float f = ((int)raw - 128) / 128.0f;
+              float a = fabsf(f);
+              if (a < DEADZONE) return 0.0f;
+              a = (a - DEADZONE) / (1.0f - DEADZONE);
+              return f < 0 ? -a : a;
+          }
+
+          static void draw_mesh(const Mesh *m) {
+              if (m->n == 0) return;
+              glVertexPointer(3, GL_FLOAT, 0, m->v);
+              glColorPointer(4, GL_FLOAT, 0, m->c);
+              glDrawArrays(GL_TRIANGLES, 0, m->n);
+          }
+
+          // ---------------------------------------------------------------- main ----
+
+          int main(void) {
+              sceCtrlSetSamplingMode(SCE_CTRL_MODE_ANALOG);
+
+              vglInit(0x800000);
+              glViewport(0, 0, 960, 544);
+
+              build_scene();
+              build_hand();
+              build_sword();
+              build_mace();
+
+              const float sky[4] = {0.45f, 0.55f, 0.75f, 1.0f};
+              glClearColor(sky[0], sky[1], sky[2], sky[3]);
+              glFogi(GL_FOG_MODE, GL_LINEAR);
+              glFogf(GL_FOG_START, 14.0f);
+              glFogf(GL_FOG_END, 52.0f);
+              glFogfv(GL_FOG_COLOR, sky);
+
+              float px = 0.0f, pz = 6.0f;   // player position
+              float yaw = 0.0f, pitch = 0.0f;
+              float t = 0.0f, bob = 0.0f;
+              char toast_buf[64];
+              float toast_t = 0.0f;
+              unsigned int prev_buttons = 0;
+              uint64_t last = sceKernelGetProcessTimeWide();
+
+              for (;;) {
+                  uint64_t now = sceKernelGetProcessTimeWide();
+                  float dt = (now - last) / 1000000.0f;
+                  last = now;
+                  if (dt > 0.1f) dt = 0.1f;
+                  t += dt;
+                  if (toast_t > 0.0f) toast_t -= dt;
+
+                  SceCtrlData pad;
+                  memset(&pad, 0, sizeof(pad));
+                  sceCtrlPeekBufferPositive(0, &pad, 1);
+                  if (pad.buttons & SCE_CTRL_START) break;
+                  unsigned int pressed = pad.buttons & ~prev_buttons;
+                  prev_buttons = pad.buttons;
+
+                  float moving = 0.0f;
+                  Pickup *near_pickup = NULL;
+
+                  if (pressed & SCE_CTRL_TRIANGLE) inv_open = !inv_open;
+
+                  if (inv_open) {
+                      // ---- inventory menu (game is paused) ----
+                      if ((pressed & SCE_CTRL_UP) && inv_sel > 0) inv_sel--;
+                      if ((pressed & SCE_CTRL_DOWN) && inv_sel < inv_n - 1) inv_sel++;
+                      if ((pressed & SCE_CTRL_CROSS) && inv_n > 0)
+                          equipped_slot = (equipped_slot == inv_sel) ? -1 : inv_sel;
+                      if (pressed & SCE_CTRL_CIRCLE) inv_open = 0;
+                  } else {
+                      // ---- exploration ----
+                      float lx = axis(pad.lx), ly = axis(pad.ly);
+                      float rx = axis(pad.rx), ry = axis(pad.ry);
+
+                      // Look: stick right turns right, stick up looks up.
+                      yaw   -= rx * LOOK_SPEED * dt;
+                      pitch -= ry * LOOK_SPEED * dt;
+                      if (pitch >  1.4f) pitch =  1.4f;
+                      if (pitch < -1.4f) pitch = -1.4f;
+
+                      // Walk relative to where we're facing.
+                      float fx = -sinf(yaw), fz = -cosf(yaw);   // forward
+                      float sx =  cosf(yaw), sz = -sinf(yaw);   // right
+                      float fwd = -ly, str = lx;
+                      px += (fx * fwd + sx * str) * MOVE_SPEED * dt;
+                      pz += (fz * fwd + sz * str) * MOVE_SPEED * dt;
+                      moving = sqrtf(fwd * fwd + str * str);
+                      if (moving > 1.0f) moving = 1.0f;
+
+                      // Stay on the plane.
+                      float lim = WORLD_HALF - 0.5f;
+                      if (px >  lim) px =  lim;
+                      if (px < -lim) px = -lim;
+                      if (pz >  lim) pz =  lim;
+                      if (pz < -lim) pz = -lim;
+
+                      // Push out of objects.
+                      for (int i = 0; i < ncolliders; i++) {
+                          float dx = px - colliders[i].x, dz = pz - colliders[i].z;
+                          float d = sqrtf(dx * dx + dz * dz);
+                          float minD = colliders[i].r + PLAYER_R;
+                          if (d < minD && d > 1e-4f) {
+                              px = colliders[i].x + dx / d * minD;
+                              pz = colliders[i].z + dz / d * minD;
+                          }
+                      }
+
+                      // Nearest pick-up in range.
+                      float best = PICKUP_RANGE;
+                      for (int i = 0; i < NUM_PICKUPS; i++) {
+                          if (pickups[i].taken) continue;
+                          float dx = px - pickups[i].x, dz = pz - pickups[i].z;
+                          float d = sqrtf(dx * dx + dz * dz);
+                          if (d < best) { best = d; near_pickup = &pickups[i]; }
+                      }
+                      if (near_pickup && (pressed & SCE_CTRL_CROSS)) {
+                          if (inv_n < INV_MAX) {
+                              inv[inv_n++] = near_pickup->item;
+                              near_pickup->taken = 1;
+                              snprintf(toast_buf, sizeof(toast_buf), "PICKED UP %s", item_defs[near_pickup->item].name);
+                          } else {
+                              snprintf(toast_buf, sizeof(toast_buf), "INVENTORY FULL");
+                          }
+                          toast_t = 2.0f;
+                          near_pickup = NULL;
+                      }
+                  }
+
+                  bob += dt * moving * 9.0f;
+
+                  // ---- draw world ----
+                  glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+                  glEnable(GL_DEPTH_TEST);
+                  glEnable(GL_FOG);
+
+                  const float near_ = 0.1f, far_ = 100.0f;
+                  float top = near_ * tanf(35.0f * PI_F / 180.0f);   // 70 degree vertical FOV
+                  float right = top * (960.0f / 544.0f);
+                  glMatrixMode(GL_PROJECTION);
+                  glLoadIdentity();
+                  glFrustum(-right, right, -top, top, near_, far_);
+
+                  glMatrixMode(GL_MODELVIEW);
+                  glLoadIdentity();
+                  glRotatef(-pitch * 180.0f / PI_F, 1, 0, 0);
+                  glRotatef(-yaw * 180.0f / PI_F, 0, 1, 0);
+                  glTranslatef(-px, -EYE_HEIGHT, -pz);
+
+                  glEnableClientState(GL_VERTEX_ARRAY);
+                  glEnableClientState(GL_COLOR_ARRAY);
+                  draw_mesh(&world_mesh);
+
+                  // Floating, spinning pick-ups.
+                  for (int i = 0; i < NUM_PICKUPS; i++) {
+                      if (pickups[i].taken) continue;
+                      glPushMatrix();
+                      glTranslatef(pickups[i].x, 1.25f + sinf(t * 2.0f + i) * 0.1f, pickups[i].z);
+                      glRotatef(t * 70.0f + i * 90.0f, 0, 1, 0);
+                      glTranslatef(0, -0.4f, 0);
+                      draw_mesh(item_defs[pickups[i].item].mesh);
+                      glPopMatrix();
+                  }
+
+                  // ---- draw held weapon (view model) ----
+                  // Depth is cleared so it never clips into walls; no fog on the hand.
+                  glClear(GL_DEPTH_BUFFER_BIT);
+                  glDisable(GL_FOG);
+                  glMatrixMode(GL_MODELVIEW);
+                  glLoadIdentity();
+                  glTranslatef(VM_X + sinf(bob) * 0.012f * moving,
+                               VM_Y + fabsf(sinf(bob)) * 0.018f * moving + sinf(t * 1.5f) * 0.004f,
+                               VM_Z);
+                  glRotatef(VM_ROT_Z, 0, 0, 1);
+                  glRotatef(VM_ROT_X, 1, 0, 0);
+                  draw_mesh(&hand_mesh);
+                  if (equipped_slot >= 0) draw_mesh(item_defs[inv[equipped_slot]].mesh);
+                  glDisableClientState(GL_COLOR_ARRAY);
+                  glDisableClientState(GL_VERTEX_ARRAY);
+
+                  // ---- draw HUD ----
+                  build_hud(near_pickup, toast_t > 0.0f ? toast_buf : NULL);
+                  glDisable(GL_DEPTH_TEST);
+                  glEnable(GL_BLEND);
+                  glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+                  glMatrixMode(GL_PROJECTION);
+                  glLoadIdentity();
+                  glOrtho(0, 960, 544, 0, -1, 1);
+                  glMatrixMode(GL_MODELVIEW);
+                  glLoadIdentity();
+                  glEnableClientState(GL_VERTEX_ARRAY);
+                  glEnableClientState(GL_COLOR_ARRAY);
+                  glVertexPointer(2, GL_FLOAT, 0, hud_v);
+                  glColorPointer(4, GL_FLOAT, 0, hud_c);
+                  if (hud_n > 0) glDrawArrays(GL_TRIANGLES, 0, hud_n);
+                  glDisableClientState(GL_COLOR_ARRAY);
+                  glDisableClientState(GL_VERTEX_ARRAY);
+                  glDisable(GL_BLEND);
+
+                  vglSwapBuffers(GL_FALSE);
+              }
+
+              vglEnd();
+              sceKernelExitProcess(0);
+              return 0;
+          }
+          MAIN_C_EOF
+          cat > app/CMakeLists.txt <<'CMAKE_EOF'
+          cmake_minimum_required(VERSION 3.5)
+
+          if(NOT DEFINED CMAKE_TOOLCHAIN_FILE)
+            if(DEFINED ENV{VITASDK})
+              set(CMAKE_TOOLCHAIN_FILE "$ENV{VITASDK}/share/vita.toolchain.cmake" CACHE PATH "toolchain file")
+            else()
+              message(FATAL_ERROR "VITASDK is not set. Install vitasdk or build via the GitHub workflow.")
+            endif()
+          endif()
+
+          project(PlainWalk C)
+          include("$ENV{VITASDK}/share/vita.cmake" REQUIRED)
+
+          set(VITA_APP_NAME "Plain Walk")
+          set(VITA_TITLEID  "PLWK00001")
+          set(VITA_VERSION  "01.00")
+
+          set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wl,-q -O2 -std=gnu99")
+
+          add_executable(${PROJECT_NAME} src/main.c)
+
+          target_link_libraries(${PROJECT_NAME}
+            vitaGL
+            vitashark
+            mathneon
+            SceShaccCg_stub
+            SceGxm_stub
+            SceDisplay_stub
+            SceCtrl_stub
+            SceSysmodule_stub
+            SceAppMgr_stub
+            SceAppUtil_stub
+            SceCommonDialog_stub
+            SceKernelDmacMgr_stub
+            taihen_stub
+            m
+            c
+          )
+
+          vita_create_self(${PROJECT_NAME}.self ${PROJECT_NAME})
+
+          set(ICON "${CMAKE_SOURCE_DIR}/sce_sys/icon0.png")
+          if(EXISTS "${ICON}")
+            vita_create_vpk(${PROJECT_NAME}.vpk ${VITA_TITLEID} ${PROJECT_NAME}.self
+              VERSION ${VITA_VERSION}
+              NAME ${VITA_APP_NAME}
+              FILE ${ICON} sce_sys/icon0.png
+            )
+          else()
+            vita_create_vpk(${PROJECT_NAME}.vpk ${VITA_TITLEID} ${PROJECT_NAME}.self
+              VERSION ${VITA_VERSION}
+              NAME ${VITA_APP_NAME}
+            )
+          endif()
+          CMAKE_EOF
+
+      - name: Install vitaGL and its dependencies
+        run: |
+          git clone --depth 1 https://github.com/vitasdk/vdpm /tmp/vdpm
+          cd /tmp/vdpm
+          ./vdpm vitashark
+          ./vdpm mathneon
+          git clone --depth 1 https://github.com/Rinnegatamante/vitaGL /tmp/vitaGL
+          make -C /tmp/vitaGL -j$(nproc) install
+
+      - name: Build VPK
+        run: |
+          cd app
+          cmake -S . -B build
+          cmake --build build -j$(nproc)
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PlainWalk-vpk
+          path: app/build/*.vpk
+
+      - name: Publish to Releases (direct .vpk download)
+        continue-on-error: true
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: Build ${{ github.run_number }}
+          files: app/build/*.vpk
