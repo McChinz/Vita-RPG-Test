@@ -1,0 +1,66 @@
+name: Build Vita VPK
+
+# Upload PlainWalk.zip to the repo root (Add file > Upload files).
+# Every push rebuilds it into PlainWalk.vpk (see Releases / run Artifacts).
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: vitasdk/vitasdk:latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Unpack project zip
+        run: |
+          ZIP=PlainWalk.zip
+          if [ ! -f "$ZIP" ]; then ZIP=$(ls *.zip 2>/dev/null | head -n1); fi
+          if [ -z "$ZIP" ]; then echo "No .zip found in the repo root. Upload PlainWalk.zip."; exit 1; fi
+          echo "Using $ZIP"
+          mkdir -p unpacked
+          cd unpacked
+          cmake -E tar xf "../$ZIP"
+          cd ..
+          CML=$(find unpacked -name CMakeLists.txt -not -path '*__MACOSX*' | head -n1)
+          if [ -z "$CML" ]; then echo "No CMakeLists.txt found inside $ZIP"; exit 1; fi
+          dirname "$CML" > project_dir.txt
+          echo "Project dir: $(cat project_dir.txt)"
+          find "$(cat project_dir.txt)" -type f | head -50
+
+      - name: Build vitaGL dependencies from source
+        run: |
+          echo "VITASDK=$VITASDK"
+          git clone --depth 1 https://github.com/Rinnegatamante/vitaShaRK /tmp/vitaShaRK
+          make -C /tmp/vitaShaRK -j$(nproc) install
+          git clone --depth 1 https://github.com/Rinnegatamante/math-neon /tmp/math-neon
+          make -C /tmp/math-neon -j$(nproc) install
+
+      - name: Build vitaGL
+        run: |
+          git clone --depth 1 https://github.com/Rinnegatamante/vitaGL /tmp/vitaGL
+          make -C /tmp/vitaGL -j$(nproc) install
+
+      - name: Build VPK
+        run: |
+          cmake -S "$(cat project_dir.txt)" -B out
+          cmake --build out -j$(nproc)
+          ls -la out/*.vpk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PlainWalk-vpk
+          path: out/*.vpk
+
+      - name: Publish to Releases (direct .vpk download)
+        continue-on-error: true
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: Build ${{ github.run_number }}
+          files: out/*.vpk
